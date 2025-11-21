@@ -1,0 +1,182 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import KFold
+from xgboost import XGBRegressor
+
+def generate_synthetic_data(n=5000, p=10, ate=2.0, random_state=42):
+    np.random.seed(random_state)
+    X = np.random.normal(0, 1, size=(n, p))
+
+    treatment = np.random.binomial(1, 0.5, size=n)
+
+    baseline = X[:, 0] + 0.5 * X[:, 1] - X[:, 2]
+    treatment_effect = ate
+    y = baseline + treatment * treatment_effect + np.random.normal(0, 1, n)
+
+    df = pd.DataFrame(X, columns=[f"x{i}" for i in range(p)])
+    df["treatment"] = treatment
+    df["y"] = y
+
+    return df, treatment_effect
+
+def get_model(model_type="rf"):
+    if model_type == "xgb":
+        return XGBRegressor(
+            n_estimators=200, max_depth=5, learning_rate=0.05,
+            subsample=0.8, colsample_bytree=0.8
+        )
+    return RandomForestRegressor(n_estimators=300, max_depth=6)
+
+
+def t_learner(df, model_type="rf"):
+    model_treated = get_model(model_type)
+    model_control = get_model(model_type)
+
+    df_t = df[df.treatment == 1]
+    df_c = df[df.treatment == 0]
+
+    model_treated.fit(df_t.iloc[:, :-2], df_t["y"])
+    model_control.fit(df_c.iloc[:, :-2], df_c["y"])
+
+    mu1 = model_treated.predict(df.iloc[:, :-2])
+    mu0 = model_control.predict(df.iloc[:, :-2])
+
+    return mu1 - mu0
+
+
+
+def s_learner(df, model_type="rf"):
+    model = get_model(model_type)
+    X = df.iloc[:, :-1]  
+    y = df["y"]
+    model.fit(X, y)
+
+    X1 = X.copy()
+    X1["treatment"] = 1
+    X0 = X.copy()
+    X0["treatment"] = 0
+
+    mu1 = model.predict(X1)
+    mu0 = model.predict(X0)
+
+    return mu1 - mu0
+
+
+
+def x_learner(df, model_type="rf"):
+    t = df["treatment"].values
+    X = df.iloc[:, :-2]
+    y = df["y"].values
+
+    model_treated = get_model(model_type)
+    model_control = get_model(model_type)
+
+    model_treated.fit(X[t == 1], y[t == 1])
+    model_control.fit(X[t == 0], y[t == 0])
+
+    D1 = y[t == 1] - model_control.predict(X[t == 1])
+    D0 = model_treated.predict(X[t == 0]) - y[t == 0]
+
+    model_D1 = get_model(model_type)
+    model_D0 = get_model(model_type)
+
+    model_D1.fit(X[t == 1], D1)
+    model_D0.fit(X[t == 0], D0)
+
+    tau1 = model_D0.predict(X)
+    tau0 = model_D1.predict(X)
+
+    g = 0.5
+    return g * tau1 + (1 - g) * tau0
+
+
+
+def qini_curve(uplift, treatment, y):
+    df = pd.DataFrame({"uplift": uplift, "t": treatment, "y": y})
+    df = df.sort_values("uplift", ascending=False)
+
+    gains = (df.t * df.y).cumsum() - ((1 - df.t) * df.y).cumsum()
+    return gains / len(df)
+
+
+def qini_auc_score(uplift, treatment, y):
+    q = qini_curve(uplift, treatment, y)
+    return np.trapz(q)
+
+
+def auuc_score(uplift, treatment, y):
+    sorted_idx = np.argsort(-uplift)
+    y_sorted = y[sorted_idx]
+    return np.trapz(np.cumsum(y_sorted)) / len(y)
+
+
+def cross_fit(model_func, df):
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    ates = []
+
+    for train_idx, test_idx in kf.split(df):
+        df_tr = df.iloc[train_idx]
+        df_te = df.iloc[test_idx]
+
+        uplift = model_func(df_tr).mean()
+        ates.append(uplift)
+
+    return np.mean(ates)
+
+
+df, true_ate = generate_synthetic_data()
+
+print("\nGenerating synthetic dataset...")
+print(df.head())
+print(f"True ATE: {true_ate}")
+
+t_uplift = t_learner(df)
+s_uplift = s_learner(df)
+x_uplift = x_learner(df)
+
+t_est = t_uplift.mean()
+s_est = s_uplift.mean()
+x_est = x_uplift.mean()
+
+t_q = qini_auc_score(t_uplift, df.treatment, df.y)
+s_q = qini_auc_score(s_uplift, df.treatment, df.y)
+x_q = qini_auc_score(x_uplift, df.treatment, df.y)
+
+t_auuc = auuc_score(t_uplift, df.treatment, df.y)
+s_auuc = auuc_score(s_uplift, df.treatment, df.y)
+x_auuc = auuc_score(x_uplift, df.treatment, df.y)
+
+
+plt.figure(figsize=(10, 6))
+plt.plot(qini_curve(t_uplift, df.treatment, df.y), label="T-Learner")
+plt.plot(qini_curve(s_uplift, df.treatment, df.y), label="S-Learner")
+plt.plot(qini_curve(x_uplift, df.treatment, df.y), label="X-Learner")
+plt.title("Qini Curves")
+plt.xlabel("Population %")
+plt.ylabel("Incremental Gain")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+
+print("\n===============================")
+print("       ATE Results")
+print("===============================")
+print(f"T-Learner Estimated ATE: {t_est}")
+print(f"S-Learner Estimated ATE: {s_est}")
+print(f"X-Learner Estimated ATE: {x_est}")
+
+print("\n===============================")
+print("     Uplift Metric Results")
+print("===============================")
+print(f"T-Learner Qini AUC: {t_q}")
+print(f"S-Learner Qini AUC: {s_q}")
+print(f"X-Learner Qini AUC: {x_q}")
+
+print(f"\nT-Learner AUUC: {t_auuc}")
+print(f"S-Learner AUUC: {s_auuc}")
+print(f"X-Learner AUUC: {x_auuc}")
+
+print("\nProject Completed Successfully with ALL required features.")
